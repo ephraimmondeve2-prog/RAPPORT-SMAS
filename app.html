@@ -606,7 +606,7 @@
   <div class="section" id="section-recues">
     <div class="card">
       <div class="card-title"><i class="ti ti-inbox"></i> Synthèses reçues des stations</div>
-      <p class="section-sub">Espace du chef de service. Importez les fichiers de synthèse (.json) envoyés par les stations : ils sont regroupés ici et consultables intégralement. La sauvegarde de l'archive permet de tout conserver en un seul fichier.</p>
+      <p class="section-sub">Espace du chef de service. Les rapports envoyés par les stations arrivent ici <strong>automatiquement</strong> via le serveur — plus besoin d'échanger des fichiers. Le bouton « Importer » reste disponible comme dépannage (station hors ligne ayant transmis un fichier .json). « Sauvegarder l'archive » télécharge une copie de toutes les synthèses.</p>
       <div class="submit-area" style="justify-content:flex-start">
         <label class="btn-primary" style="display:inline-flex;align-items:center;gap:7px;cursor:pointer"><i class="ti ti-upload"></i> Importer des synthèses<input type="file" accept=".json,application/json" multiple hidden onchange="importRecues(this)"></label>
         <button class="btn-secondary" onclick="exportArchive()"><i class="ti ti-download"></i> Sauvegarder l'archive</button>
@@ -1149,69 +1149,83 @@ function normalizeSubmission(obj){
 }
 function fmtWhen(iso){ if (!iso) return '—'; try { return new Date(iso).toLocaleString('fr-FR'); } catch(e){ return iso; } }
 
-/* Côté station : valider + envoyer le rapport */
-function sendReport(){
+/* Côté station : valider + envoyer le rapport AU SERVEUR */
+async function sendReport(){
   const station = val('f-station'), mois = val('f-mois');
   if (!station || !mois) { alert('Veuillez renseigner au moins la Station et le Mois (onglet Personnel) avant d’envoyer.'); showSection('personnel'); return; }
   const sub = makeSubmission();
-  addToArchive(sub);
-  const blob = new Blob([JSON.stringify(sub, null, 2)], { type: 'application/json' });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = 'Synthese_' + station.replace(/[^\w]+/g, '_') + '_' + mois.replace(/\s+/g, '_') + '.json';
-  a.click();
-  URL.revokeObjectURL(url);
-  alert('Rapport validé et envoyé.\n\nUn fichier « ' + a.download + ' » a été généré : transmettez-le au chef de service (mail, clé USB…).\nIl apparaît aussi dans l’onglet « Synthèses reçues » de ce poste.');
+  try {
+    await api('/api/submissions', { method:'POST', body: JSON.stringify(sub) });
+    alert('Rapport envoyé au serveur.\n\nLe chef de service le voit désormais automatiquement dans « Synthèses reçues », depuis n’importe quel poste. Aucun fichier à transmettre.');
+  } catch(e) {
+    // Repli hors-ligne : on génère le fichier .json à transmettre manuellement.
+    addToArchive(sub);
+    const blob = new Blob([JSON.stringify(sub, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'Synthese_' + station.replace(/[^\w]+/g, '_') + '_' + mois.replace(/\s+/g, '_') + '.json';
+    a.click();
+    URL.revokeObjectURL(url);
+    alert('Envoi au serveur impossible (' + e.message + ').\n\nUn fichier « ' + a.download + ' » a été généré : transmettez-le au chef de service (mail, clé USB) pour qu’il l’importe.');
+  }
 }
 
-/* Côté chef : import, liste, consultation */
-function importRecues(input){
+/* Côté chef : synthèses chargées depuis le serveur */
+let recuesData = [];
+async function importRecues(input){
   const files = [...(input.files || [])];
   if (!files.length) return;
-  let added = 0, done = 0;
+  let added = 0, ko = 0, done = 0;
   files.forEach(file => {
     const r = new FileReader();
-    r.onload = () => {
-      try { const sub = normalizeSubmission(JSON.parse(r.result)); if (sub) { addToArchive(sub); added++; } } catch(e){}
-      if (++done === files.length) { renderRecuesList(); alert(added + ' synthèse(s) importée(s).'); }
+    r.onload = async () => {
+      try {
+        const sub = normalizeSubmission(JSON.parse(r.result));
+        if (sub) { await api('/api/submissions', { method:'POST', body: JSON.stringify(sub) }); added++; }
+        else ko++;
+      } catch(e){ ko++; }
+      if (++done === files.length) { await renderRecuesList(); alert(added + ' synthèse(s) importée(s) sur le serveur' + (ko ? ', ' + ko + ' ignorée(s)' : '') + '.'); }
     };
     r.readAsText(file);
   });
   input.value = '';
 }
 function exportArchive(){
-  const a = getArchive();
-  if (!a.length) { alert('Aucune synthèse à sauvegarder.'); return; }
-  const blob = new Blob([JSON.stringify(a, null, 2)], { type: 'application/json' });
+  if (!recuesData.length) { alert('Aucune synthèse à sauvegarder.'); return; }
+  const blob = new Blob([JSON.stringify(recuesData, null, 2)], { type: 'application/json' });
   const url = URL.createObjectURL(blob);
   const el = document.createElement('a');
   el.href = url; el.download = 'SODEXAM_Syntheses_recues.json';
   el.click(); URL.revokeObjectURL(url);
 }
-function importArchive(input){
+async function importArchive(input){
   const file = input.files && input.files[0];
   if (!file) return;
   const r = new FileReader();
-  r.onload = () => {
+  r.onload = async () => {
     try {
       const arr = JSON.parse(r.result);
       if (!Array.isArray(arr)) throw 0;
-      arr.forEach(o => { const sub = normalizeSubmission(o); if (sub) addToArchive(sub); });
-      renderRecuesList();
-      alert('Archive restaurée (' + arr.length + ' entrée(s) fusionnée(s)).');
+      let n = 0;
+      for (const o of arr) { const sub = normalizeSubmission(o); if (sub) { await api('/api/submissions', { method:'POST', body: JSON.stringify(sub) }); n++; } }
+      await renderRecuesList();
+      alert('Archive restaurée sur le serveur (' + n + ' entrée(s)).');
     } catch(e){ alert('Fichier d’archive invalide.'); }
   };
   r.readAsText(file);
   input.value = '';
 }
-function deleteRecue(idx){
+async function deleteRecue(idx){
+  const s = recuesData[idx];
+  if (!s) return;
   if (!confirm('Supprimer définitivement cette synthèse reçue ?')) return;
-  const a = getArchive(); a.splice(idx, 1); setArchive(a);
-  renderRecuesList(); closeRecueViewer();
+  try { await api('/api/submissions/delete', { method:'POST', body: JSON.stringify({ id: s.id }) }); }
+  catch(e){ alert(e.message); return; }
+  await renderRecuesList(); closeRecueViewer();
 }
 function viewRecue(idx){
-  const s = getArchive()[idx];
+  const s = recuesData[idx];
   if (!s) return;
   document.getElementById('recues-viewer-title').textContent = 'Synthèse — ' + (s.station || '—') + ' — ' + (s.mois || '—');
   document.getElementById('recues-viewer').innerHTML = renderSyntheseHTML(collectDataFrom(s.state));
@@ -1220,11 +1234,13 @@ function viewRecue(idx){
   if (card.scrollIntoView) card.scrollIntoView({ behavior: 'smooth', block: 'start' });
 }
 function closeRecueViewer(){ document.getElementById('recues-viewer-card').style.display = 'none'; }
-function renderRecuesList(){
-  const a = getArchive();
+async function renderRecuesList(){
   const box = document.getElementById('recues-list');
   if (!box) return;
-  if (!a.length) { box.innerHTML = '<p class="section-sub" style="margin-top:1rem">Aucune synthèse reçue pour le moment. Importez les fichiers .json envoyés par les stations.</p>'; return; }
+  try { recuesData = (await api('/api/submissions')).submissions || []; }
+  catch(e){ box.innerHTML = '<p class="section-sub" style="margin-top:1rem;color:var(--red)">' + esc(e.message) + '</p>'; return; }
+  const a = recuesData;
+  if (!a.length) { box.innerHTML = '<p class="section-sub" style="margin-top:1rem">Aucune synthèse reçue pour le moment. Les stations qui envoient leur rapport apparaîtront ici automatiquement.</p>'; return; }
   const rows = a.map((s, idx) => {
     const d = collectDataFrom(s.state);
     const chef = d.chef ? d.chef.nom : '—';
