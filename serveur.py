@@ -91,6 +91,16 @@ def init_db():
                created_at TEXT
            )"""
     )
+    con.execute(
+        """CREATE TABLE IF NOT EXISTS submissions (
+               id        TEXT PRIMARY KEY,
+               station   TEXT,
+               mois      TEXT,
+               reference TEXT,
+               sent_at   TEXT,
+               payload   TEXT NOT NULL
+           )"""
+    )
     con.commit()
     con.close()
 
@@ -198,6 +208,51 @@ def count_admins():
     n = con.execute("SELECT COUNT(*) FROM accounts WHERE role = 'admin'").fetchone()[0]
     con.close()
     return n
+
+
+# ----- Synthèses transmises par les stations -------------------------------- #
+def save_submission(sub):
+    """sub = dict {id, station, mois, reference, sentAt, state, ...}."""
+    sid = sub.get("id") or (str(sub.get("station", "")) + "|" + str(sub.get("mois", "")))
+    con = db()
+    con.execute(
+        """INSERT INTO submissions (id, station, mois, reference, sent_at, payload)
+               VALUES (?, ?, ?, ?, ?, ?)
+           ON CONFLICT(id) DO UPDATE SET
+               station = excluded.station,
+               mois = excluded.mois,
+               reference = excluded.reference,
+               sent_at = excluded.sent_at,
+               payload = excluded.payload""",
+        (sid, sub.get("station", ""), sub.get("mois", ""), sub.get("reference", ""),
+         sub.get("sentAt") or datetime.datetime.now().isoformat(timespec="seconds"),
+         json.dumps(sub, ensure_ascii=False)),
+    )
+    con.commit()
+    con.close()
+    return sid
+
+
+def list_submissions():
+    con = db()
+    rows = con.execute(
+        "SELECT payload FROM submissions ORDER BY sent_at DESC"
+    ).fetchall()
+    con.close()
+    out = []
+    for r in rows:
+        try:
+            out.append(json.loads(r["payload"]))
+        except Exception:
+            pass
+    return out
+
+
+def delete_submission(sid):
+    con = db()
+    con.execute("DELETE FROM submissions WHERE id = ?", (sid,))
+    con.commit()
+    con.close()
 
 
 def seed_accounts():
@@ -378,6 +433,39 @@ def api_password():
     if not row or row["hash"] != hash_pwd(row["salt"], old):
         abort(403, description="Mot de passe actuel incorrect.")
     upsert_account(row["username"], row["role"], row["station"], new, overwrite=True)
+    return jsonify({"ok": True})
+
+
+# ----- Synthèses reçues ----------------------------------------------------- #
+@app.route("/api/submissions", methods=["GET", "POST", "OPTIONS"])
+def api_submissions():
+    if request.method == "OPTIONS":
+        return ("", 204)
+    user = user_from_token(request.headers.get("X-Auth-Token", ""))
+    if not user:
+        abort(401, description="Session invalide, reconnectez-vous.")
+    if request.method == "POST":
+        # Une station (ou l'admin) transmet une synthèse.
+        sub = request.get_json(silent=True) or {}
+        if not sub.get("station") and not sub.get("mois"):
+            abort(400, description="Synthèse vide (station / mois manquants).")
+        return jsonify({"ok": True, "id": save_submission(sub)})
+    # GET -> réservé à l'admin
+    if user["role"] != "admin":
+        abort(403, description="Consultation réservée a l'administrateur.")
+    return jsonify({"ok": True, "submissions": list_submissions()})
+
+
+@app.route("/api/submissions/delete", methods=["POST", "OPTIONS"])
+def api_delete_submission():
+    if request.method == "OPTIONS":
+        return ("", 204)
+    require_admin()
+    data = request.get_json(silent=True) or {}
+    sid = data.get("id")
+    if not sid:
+        abort(400, description="Identifiant de synthèse manquant.")
+    delete_submission(sid)
     return jsonify({"ok": True})
 
 
